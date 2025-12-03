@@ -1,0 +1,52 @@
+name: Daily Riyasewana Scrape
+
+# Trigger: Runs at 00:00 UTC every day OR when you click the button manually
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    
+    # This creates a "Service Container" running FlareSolverr
+    # Your script can talk to this at http://localhost:8191
+    services:
+      flaresolverr:
+        image: flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: >-
+          --health-cmd "curl --fail http://localhost:8191/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    permissions:
+      contents: write  # Gives permission to save the CSV back to the repo
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Scraper
+        env:
+          # LOWER THREADS FOR GITHUB (prevents crashing)
+          SEARCH_WORKERS: 2
+          DETAIL_WORKERS: 5
+        run: python scraper.py
+
+      - name: Commit and Push Data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update: New Vehicle Data [skip ci]"
+          file_pattern: 'riyasewana_dom_data/*.csv'
