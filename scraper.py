@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-RIYASEWANA SCRAPER - HYBRID V3 (GitHub Actions Compatible)
-- Adapted for CI/CD: Reads thread counts from Environment Variables.
+RIYASEWANA SCRAPER - HYBRID V3 (OPTIMIZED)
+- OPTIMIZED: Reduced threads + added jitter to prevent IP bans.
 - FIX: Global 'SEEN_URLS' memory to stop duplicate promoted ads.
-- FIX: Smart Make/Type correction.
+- FIX: Smart Make/Type correction (Toyota on Tata page).
+- FIX: Location regex allows hyphens (Ja-Ela).
 """
 
 import time
@@ -13,7 +14,7 @@ import csv
 import re
 import threading
 import queue
-import os  # Added for GitHub Environment Variables
+import os
 import cloudscraper
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -21,16 +22,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIGURATION (OPTIMIZED)
 # ==========================================
+# NOTICE: High thread counts = Instant Ban = Slow Script.
+# These lower numbers will actually result in FASTER total scraping
+# because they keep the "Fast Mode" (CloudScraper) active.
+SEARCH_WORKERS = 3    
+DETAIL_WORKERS = 5   
 
-# 🟢 UPDATE: Auto-detects if running on GitHub to prevent crashes
-# If running locally, defaults to 4 and 20. 
-# If on GitHub, uses the Env Vars defined in the YAML file.
-SEARCH_WORKERS = int(os.environ.get('SEARCH_WORKERS', 4))
-DETAIL_WORKERS = int(os.environ.get('DETAIL_WORKERS', 20))
-
-# FlareSolverr URL (matches the Service in GitHub Actions)
 FLARESOLVERR_URL = "http://localhost:8191/v1"
 
 MAKES = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda', 
@@ -38,13 +37,13 @@ MAKES = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda',
 TYPES = ['cars', 'vans', 'suvs', 'crew-cabs', 'pickups']
 
 MAX_PAGES_PER_COMBO = 160
-DAYS_TO_KEEP = 14
+DAYS_TO_KEEP = 15
 BATCH_SIZE = 50
 
 print("="*60)
-print(f"🚀 RIYASEWANA HYBRID SCRAPER V3 (GITHUB READY)")
+print(f"🚀 RIYASEWANA HYBRID SCRAPER V3 (OPTIMIZED)")
 print(f"⚡ Search Threads: {SEARCH_WORKERS} | 📥 Extractor Threads: {DETAIL_WORKERS}")
-print(f"🔥 Mode: CloudScraper -> Failover | 🛡 Dedup Active")
+print(f"🔥 Mode: CloudScraper (Primary) -> FlareSolverr (Backup)")
 print("="*60)
 
 ad_queue = queue.Queue(maxsize=2000)
@@ -63,7 +62,6 @@ class BatchWriter:
         self.fieldnames = fieldnames
         self.buffer = []
         self.lock = threading.Lock()
-        # Initialize file with header
         with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             writer.writeheader()
@@ -90,10 +88,11 @@ class FlareSolverrClient:
     def __init__(self):
         self.url = FLARESOLVERR_URL.rstrip('/')
         self.headers = {"Content-Type": "application/json"}
+        # OPTIMIZATION: Mimic Windows Chrome for better trust score
         self.scraper = cloudscraper.create_scraper(
             browser={
                 'browser': 'chrome',
-                'platform': 'darwin',
+                'platform': 'windows',
                 'desktop': True
             }
         )
@@ -117,24 +116,36 @@ class FlareSolverrClient:
             except: pass
 
     def fetch(self, url):
-        # METHOD 1: CLOUDSCRAPER (FAST)
+        # --- METHOD 1: CLOUDSCRAPER (FAST) ---
         try:
-            r = self.scraper.get(url, timeout=10)
+            # CRITICAL: Random delay prevents the server from flagging you as a bot
+            time.sleep(random.uniform(1.0, 3.0)) 
+            
+            r = self.scraper.get(url, timeout=20)
+            
             if r.status_code == 200 and len(r.text) > 1000:
+                # Check if we actually got the content or a Cloudflare landing page
                 if "Attention Required!" not in r.text and "Access denied" not in r.text:
                     with stats_lock: stats['fast_hits'] += 1
                     return r.text
-        except: pass
+        except Exception:
+            pass # Silent fail, move to Method 2
 
-        # METHOD 2: FLARESOLVERR (FAILOVER)
+        # --- METHOD 2: FLARESOLVERR (SLOW FALLBACK) ---
         with stats_lock: stats['slow_hits'] += 1
+        
         if not self.session_id: self.create_session()
-        payload = {"cmd": "request.get", "url": url, "maxTimeout": 40000}
+        
+        payload = {"cmd": "request.get", "url": url, "maxTimeout": 60000}
         if self.session_id: payload["session"] = self.session_id
+        
         try:
-            r = requests.post(self.url, json=payload, headers=self.headers, timeout=45)
+            # FlareSolverr needs a longer timeout to process the JS challenge
+            r = requests.post(self.url, json=payload, headers=self.headers, timeout=65)
             if r.status_code == 200:
-                return r.json().get("solution", {}).get("response", "")
+                resp = r.json()
+                if resp.get("status") == "ok":
+                    return resp.get("solution", {}).get("response", "")
         except: pass
         return None
 
