@@ -37,8 +37,8 @@ MAKES = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda',
          'daihatsu', 'kia', 'hyundai', 'micro', 'audi', 'bmw', 'mercedes-benz', 'land-rover', 'tata', 'mahindra']
 TYPES = ['cars', 'vans', 'suvs', 'crew-cabs', 'pickups']
 
-MAX_PAGES_PER_COMBO = 5
-DAYS_TO_KEEP = 2
+MAX_PAGES_PER_COMBO = 160
+DAYS_TO_KEEP = 14
 BATCH_SIZE = 50
 
 print("="*60)
