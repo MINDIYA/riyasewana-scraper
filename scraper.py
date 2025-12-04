@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-RIYASEWANA SCRAPER - HYBRID V3 (OPTIMIZED)
-- OPTIMIZED: Reduced threads + added jitter to prevent IP bans.
-- FIX: Global 'SEEN_URLS' memory to stop duplicate promoted ads.
-- FIX: Smart Make/Type correction (Toyota on Tata page).
-- FIX: Location regex allows hyphens (Ja-Ela).
+SRI LANKA VEHICLE MASTER SCRAPER (Riyasewana + Patpat + Ikman)
+- COMBINED: Scrapes all 3 sites sequentially.
+- OUTPUT: 
+    1. Unified "Basic" CSV (All sites combined).
+    2. Individual "Detailed" CSVs for each site.
+- ARCHITECTURE: Class-based isolation to prevent variable conflicts.
 """
 
 import time
@@ -16,91 +17,79 @@ import threading
 import queue
 import os
 import cloudscraper
-from datetime import datetime, timedelta
+import sqlite3
+import logging
+import psutil
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # ==========================================
-# ⚙️ CONFIGURATION (OPTIMIZED)
+# ⚙️ GLOBAL CONFIGURATION
 # ==========================================
-# NOTICE: High thread counts = Instant Ban = Slow Script.
-# These lower numbers will actually result in FASTER total scraping
-# because they keep the "Fast Mode" (CloudScraper) active.
-SEARCH_WORKERS = 3    
-DETAIL_WORKERS = 5   
-
 FLARESOLVERR_URL = "http://localhost:8191/v1"
-
-MAKES = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda', 
-         'daihatsu', 'kia', 'hyundai', 'micro', 'audi', 'bmw', 'mercedes-benz', 'land-rover', 'tata', 'mahindra']
-TYPES = ['cars', 'vans', 'suvs', 'crew-cabs', 'pickups']
-
-MAX_PAGES_PER_COMBO = 160
 DAYS_TO_KEEP = 15
 BATCH_SIZE = 50
+DATA_FOLDER = "vehicle_data_master"
 
-print("="*60)
-print(f"🚀 RIYASEWANA HYBRID SCRAPER V3 (OPTIMIZED)")
-print(f"⚡ Search Threads: {SEARCH_WORKERS} | 📥 Extractor Threads: {DETAIL_WORKERS}")
-print(f"🔥 Mode: CloudScraper (Primary) -> FlareSolverr (Backup)")
-print("="*60)
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
 
-ad_queue = queue.Queue(maxsize=2000)
-stop_event = threading.Event()
+# Timestamp for files
+TS = time.strftime('%Y-%m-%d_%H-%M')
 
-# 🛡 GLOBAL MEMORY FOR DUPLICATES
-SEEN_URLS = set()
-seen_lock = threading.Lock()
+# ==========================================
+# 🛠️ SHARED TOOLS
+# ==========================================
 
-stats = {'found': 0, 'saved': 0, 'skipped_date': 0, 'fast_hits': 0, 'slow_hits': 0, 'dupes': 0}
-stats_lock = threading.Lock()
-
-class BatchWriter:
-    def __init__(self, filepath, fieldnames):
-        self.filepath = filepath
+class UnifiedBatchWriter:
+    """Writes to the Master Basic CSV and individual files."""
+    def __init__(self, filename, fieldnames):
+        self.filepath = filename
         self.fieldnames = fieldnames
         self.buffer = []
         self.lock = threading.Lock()
-        with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writeheader()
+        
+        # Initialize file with headers
+        if not os.path.exists(self.filepath):
+            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
 
     def add_row(self, row):
         with self.lock:
-            self.buffer.append(row)
+            # Ensure row only has keys that exist in fieldnames
+            clean_row = {k: row.get(k, '') for k in self.fieldnames}
+            self.buffer.append(clean_row)
             if len(self.buffer) >= BATCH_SIZE:
-                self.flush_unsafe()
+                self.flush()
 
     def flush(self):
         with self.lock:
-            if self.buffer: self.flush_unsafe()
-
-    def flush_unsafe(self):
-        try:
-            with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                writer.writerows(self.buffer)
-            self.buffer = []
-        except: pass
+            if not self.buffer: return
+            try:
+                with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writerows(self.buffer)
+                self.buffer = []
+            except Exception as e:
+                print(f"Write Error: {e}")
 
 class FlareSolverrClient:
+    """Shared Client for Cloudflare Bypassing"""
     def __init__(self):
         self.url = FLARESOLVERR_URL.rstrip('/')
         self.headers = {"Content-Type": "application/json"}
-        # OPTIMIZATION: Mimic Windows Chrome for better trust score
+        # Windows Chrome Emulation
         self.scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
+            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
         )
         self.session_id = None
 
-    def create_session(self):
+    def create_session(self, prefix="sess"):
         try:
-            sid = f"riysess_{random.randint(1000,9999)}_{int(time.time())}"
+            sid = f"{prefix}_{random.randint(1000,9999)}_{int(time.time())}"
             payload = {"cmd": "sessions.create", "session": sid}
             r = requests.post(self.url, json=payload, headers=self.headers, timeout=10)
             if r.status_code == 200:
@@ -115,32 +104,22 @@ class FlareSolverrClient:
                 requests.post(self.url, json={"cmd": "sessions.destroy", "session": self.session_id}, headers=self.headers, timeout=5)
             except: pass
 
-    def fetch(self, url):
-        # --- METHOD 1: CLOUDSCRAPER (FAST) ---
-        try:
-            # CRITICAL: Random delay prevents the server from flagging you as a bot
-            time.sleep(random.uniform(1.0, 3.0)) 
-            
-            r = self.scraper.get(url, timeout=20)
-            
-            if r.status_code == 200 and len(r.text) > 1000:
-                # Check if we actually got the content or a Cloudflare landing page
-                if "Attention Required!" not in r.text and "Access denied" not in r.text:
-                    with stats_lock: stats['fast_hits'] += 1
-                    return r.text
-        except Exception:
-            pass # Silent fail, move to Method 2
-
-        # --- METHOD 2: FLARESOLVERR (SLOW FALLBACK) ---
-        with stats_lock: stats['slow_hits'] += 1
+    def fetch(self, url, method="hybrid"):
+        # Hybrid: Try CloudScraper first, then FlareSolverr
+        if method == "hybrid":
+            try:
+                time.sleep(random.uniform(1.0, 3.0)) # Anti-ban jitter
+                r = self.scraper.get(url, timeout=20)
+                if r.status_code == 200 and len(r.text) > 1000:
+                    if "Attention Required!" not in r.text and "Access denied" not in r.text:
+                        return r.text
+            except: pass
         
+        # Fallback to FlareSolverr
         if not self.session_id: self.create_session()
-        
         payload = {"cmd": "request.get", "url": url, "maxTimeout": 60000}
         if self.session_id: payload["session"] = self.session_id
-        
         try:
-            # FlareSolverr needs a longer timeout to process the JS challenge
             r = requests.post(self.url, json=payload, headers=self.headers, timeout=65)
             if r.status_code == 200:
                 resp = r.json()
@@ -149,221 +128,519 @@ class FlareSolverrClient:
         except: pass
         return None
 
-# ---------------------------------------------------------
-# WORKER 1: LINK HUNTER (WITH GLOBAL DEDUP)
-# ---------------------------------------------------------
-def harvest_task(client, make, v_type, page_num, cutoff_date):
-    url = f"https://riyasewana.com/search/{v_type}/{make}"
-    if page_num > 1: url += f"?page={page_num}"
-    
-    html = client.fetch(url)
-    if not html: return 0
+# ==========================================
+# 1️⃣ RIYASEWANA SCRAPER CLASS
+# ==========================================
+class RiyasewanaScraper:
+    def __init__(self, unified_writer):
+        self.unified_writer = unified_writer
+        self.detail_writer = None
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.stats = {'saved': 0, 'dupes': 0}
+        self.lock = threading.Lock()
+        self.seen_urls = set()
+        
+        # Config
+        self.makes = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda', 'daihatsu', 'kia', 'hyundai', 'audi', 'bmw', 'mercedes-benz', 'land-rover', 'tata', 'mahindra']
+        self.types = ['cars', 'vans', 'suvs', 'crew-cabs', 'pickups']
+        self.max_pages = 160
+        self.workers_search = 3
+        self.workers_detail = 5
 
-    soup = BeautifulSoup(html, 'html.parser')
-    all_links = soup.find_all('a', href=True)
-    local_count = 0
-
-    for link in all_links:
-        href = link['href']
-        if '/buy/' in href and '-sale-' in href:
+    def run(self):
+        print("\n" + "="*50)
+        print("🚀 STARTING: RIYASEWANA SCRAPER")
+        print("="*50)
+        
+        cutoff = datetime.now() - timedelta(days=DAYS_TO_KEEP)
+        det_csv = f"{DATA_FOLDER}/RIYASEWANA_DETAILED_{TS}.csv"
+        
+        # Headers
+        det_fields = ['Date', 'Make', 'Type', 'YOM', 'Model', 'Price', 'Transmission', 'Fuel', 'Engine', 'Mileage', 'Location', 'Contact', 'URL']
+        self.detail_writer = UnifiedBatchWriter(det_csv, det_fields)
+        
+        client = FlareSolverrClient()
+        
+        # Start Extractors
+        ex_pool = ThreadPoolExecutor(max_workers=self.workers_detail)
+        for _ in range(self.workers_detail):
+            ex_pool.submit(self.extractor_worker, cutoff)
             
-            # 🛡 GLOBAL DUPLICATE CHECK
-            with seen_lock:
-                if href in SEEN_URLS:
-                    with stats_lock: stats['dupes'] += 1
-                    continue
-                SEEN_URLS.add(href)
-            
-            title = link.get_text(" ", strip=True)
-            if len(title) < 5:
-                h2 = link.find_parent('h2')
-                if h2: title = h2.get_text(" ", strip=True)
+        # Start Crawling
+        tasks = []
+        for m in self.makes:
+            for t in self.types:
+                for p in range(1, self.max_pages + 1):
+                    tasks.append((m, t, p))
+        random.shuffle(tasks)
+        
+        with ThreadPoolExecutor(max_workers=self.workers_search) as s_pool:
+            futures = [s_pool.submit(self.harvest_task, client, m, t, p, cutoff) for m, t, p in tasks]
+            with tqdm(total=len(futures), desc="Riya Crawl") as pbar:
+                for _ in as_completed(futures):
+                    pbar.update(1)
+        
+        self.queue.join()
+        self.stop_event.set()
+        ex_pool.shutdown(wait=True)
+        self.detail_writer.flush()
+        print(f"✅ Riyasewana Done. Saved: {self.stats['saved']}")
 
-            container = link.find_parent('li')
-            if not container: container = link.find_parent('div', class_=re.compile('item'))
-            
-            final_date = "Check_Page"
-            price = "0"
-
-            if container:
-                cont_text = container.get_text(" ", strip=True)
-                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', cont_text)
-                if date_match:
-                    d_str = date_match.group(1)
-                    try:
-                        if datetime.strptime(d_str, "%Y-%m-%d") < cutoff_date:
-                            with stats_lock: stats['skipped_date'] += 1
-                            continue 
-                        final_date = d_str
-                    except: pass
+    def harvest_task(self, client, make, v_type, page, cutoff):
+        url = f"https://riyasewana.com/search/{v_type}/{make}"
+        if page > 1: url += f"?page={page}"
+        
+        html = client.fetch(url)
+        if not html: return
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if '/buy/' in href and '-sale-' in href:
+                with self.lock:
+                    if href in self.seen_urls:
+                        self.stats['dupes'] += 1
+                        continue
+                    self.seen_urls.add(href)
                 
-                price_match = re.search(r'Rs\.?\s*([\d,]+)', cont_text)
-                if price_match:
-                    price = price_match.group(1).replace(',', '')
+                title = link.get_text(" ", strip=True)
+                if len(title) < 5: 
+                    h2 = link.find_parent('h2')
+                    if h2: title = h2.get_text(" ", strip=True)
+                
+                # Basic Date Check
+                date_val = "Check_Page"
+                price = "0"
+                container = link.find_parent('li') or link.find_parent('div', class_=re.compile('item'))
+                if container:
+                    txt = container.get_text(" ", strip=True)
+                    dm = re.search(r'(\d{4}-\d{2}-\d{2})', txt)
+                    if dm:
+                        try:
+                            if datetime.strptime(dm.group(1), "%Y-%m-%d") < cutoff: continue
+                            date_val = dm.group(1)
+                        except: pass
+                    pm = re.search(r'Rs\.?\s*([\d,]+)', txt)
+                    if pm: price = pm.group(1).replace(',', '')
 
-            item = {'url': href, 'date': final_date, 'make': make, 'type': v_type, 'title': title, 'price': price}
-            ad_queue.put(item)
-            local_count += 1
+                self.queue.put({'url': href, 'date': date_val, 'make': make, 'type': v_type, 'title': title, 'price': price})
 
-    with stats_lock: stats['found'] += local_count
-    return local_count
+    def extractor_worker(self, cutoff):
+        client = FlareSolverrClient()
+        re_yom = re.compile(r'\b(20\d{2}|19\d{2})\b')
+        re_phone = re.compile(r'(?:07\d|0\d{2})[- ]?\d{3}[- ]?\d{4}')
 
-# ---------------------------------------------------------
-# WORKER 2: DOM MASTER EXTRACTOR (SMART LOGIC)
-# ---------------------------------------------------------
-def extractor_worker(basic_writer, detail_writer, cutoff_date):
-    client = FlareSolverrClient()
-    re_phone = re.compile(r'(?:07\d|0\d{2})[- ]?\d{3}[- ]?\d{4}')
-    re_yom = re.compile(r'\b(20\d{2}|19\d{2})\b')
-    
-    while not stop_event.is_set() or not ad_queue.empty():
+        while not self.stop_event.is_set() or not self.queue.empty():
+            try: item = self.queue.get(timeout=3)
+            except: continue
+            
+            try:
+                html = client.fetch(item['url'])
+                if not html: continue
+                soup = BeautifulSoup(html, "html.parser")
+                full_text = soup.get_text(" ", strip=True)
+
+                # Date Logic
+                if item['date'] == "Check_Page":
+                    dm = re.search(r'(\d{4}-\d{2}-\d{2})', full_text)
+                    if dm:
+                        try:
+                            if datetime.strptime(dm.group(1), "%Y-%m-%d") < cutoff: continue
+                            item['date'] = dm.group(1)
+                        except: pass
+                    else: item['date'] = datetime.now().strftime("%Y-%m-%d")
+
+                details = {'YOM': '', 'Transmission': '', 'Fuel': '', 'Engine': '', 'Mileage': '', 'Location': '', 'Contact': ''}
+                
+                # DOM Logic
+                for label in soup.find_all('p', class_='moreh'):
+                    txt = label.get_text(strip=True).lower()
+                    parent = label.find_parent('td')
+                    if parent:
+                        val_td = parent.find_next_sibling('td')
+                        if val_td:
+                            val = val_td.get_text(strip=True)
+                            if 'mileage' in txt: details['Mileage'] = val
+                            elif 'engine' in txt: details['Engine'] = val
+                            elif 'transmission' in txt: details['Transmission'] = val
+                            elif 'fuel' in txt: details['Fuel'] = val
+                            elif 'yom' in txt: details['YOM'] = val
+                
+                if not details['YOM']:
+                    ym = re_yom.search(item['title'])
+                    if ym: details['YOM'] = ym.group(1)
+                
+                phones = re_phone.findall(full_text)
+                if phones: details['Contact'] = " / ".join(set([p.replace('-','').replace(' ','') for p in phones]))
+
+                # Write to Basic Unified
+                basic_row = {
+                    'Source': 'Riyasewana', 'Date': item['date'], 'Make': item['make'], 
+                    'Type': item['type'], 'YOM': details['YOM'], 'Model': item['title'], 
+                    'Price': item['price'], 'URL': item['url']
+                }
+                self.unified_writer.add_row(basic_row)
+
+                # Write to Detailed
+                detail_row = {**basic_row, **details}
+                del detail_row['Source'] # Remove source from detailed if not needed
+                self.detail_writer.add_row(detail_row)
+                
+                with self.lock: self.stats['saved'] += 1
+
+            except: pass
+            finally: self.queue.task_done()
+        client.destroy_session()
+
+
+# ==========================================
+# 2️⃣ PATPAT SCRAPER CLASS
+# ==========================================
+class PatpatScraper:
+    def __init__(self, unified_writer):
+        self.unified_writer = unified_writer
+        self.detail_writer = None
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.stats = {'saved': 0, 'dupes': 0}
+        self.lock = threading.Lock()
+        
+        # Use SQLite for Patpat as per original code (it helps with larger datasets)
+        self.db_path = f"{DATA_FOLDER}/patpat_seen.sqlite"
+        self._init_db()
+        
+        self.makes = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda', 'kia', 'hyundai', 'micro', 'audi', 'bmw', 'tata']
+        self.types = ['cars', 'vans', 'suvs', 'crew-cabs', 'pickups']
+        self.max_pages = 160
+        self.workers = 5 # Lower workers for Patpat as it's heavy
+
+    def _init_db(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS seen (url TEXT PRIMARY KEY)")
+        self.conn.commit()
+
+    def is_seen(self, url):
+        cur = self.conn.execute("SELECT 1 FROM seen WHERE url = ?", (url,))
+        return cur.fetchone() is not None
+
+    def mark_seen(self, url):
         try:
-            item = ad_queue.get(timeout=3)
-        except queue.Empty: continue
+            self.conn.execute("INSERT OR IGNORE INTO seen (url) VALUES (?)", (url,))
+            self.conn.commit()
+        except: pass
 
-        try:
-            html = client.fetch(item['url'])
-            if not html: continue
+    def run(self):
+        print("\n" + "="*50)
+        print("🚀 STARTING: PATPAT.LK SCRAPER")
+        print("="*50)
+        
+        cutoff = datetime.now() - timedelta(days=DAYS_TO_KEEP)
+        det_csv = f"{DATA_FOLDER}/PATPAT_DETAILED_{TS}.csv"
+        det_fields = ['Date', 'Make', 'Type', 'YOM', 'Model', 'Price', 'Transmission', 'Fuel', 'Engine', 'Mileage', 'Location', 'Contact', 'URL', 'Description']
+        self.detail_writer = UnifiedBatchWriter(det_csv, det_fields)
+        
+        # Start Extractor Threads
+        ex_pool = ThreadPoolExecutor(max_workers=self.workers)
+        for _ in range(self.workers):
+            ex_pool.submit(self.extractor_worker, cutoff)
+            
+        # Start Crawling
+        client = FlareSolverrClient()
+        tasks = []
+        for m in self.makes:
+            for t in self.types:
+                for p in range(1, self.max_pages + 1):
+                    tasks.append((m, t, p))
+        random.shuffle(tasks)
+        
+        with ThreadPoolExecutor(max_workers=self.workers) as s_pool:
+            futures = [s_pool.submit(self.harvest_task, client, m, t, p, cutoff) for m, t, p in tasks]
+            with tqdm(total=len(futures), desc="Patpat Crawl") as pbar:
+                for _ in as_completed(futures):
+                    pbar.update(1)
+        
+        self.queue.join()
+        self.stop_event.set()
+        ex_pool.shutdown(wait=True)
+        self.detail_writer.flush()
+        self.conn.close()
+        print(f"✅ Patpat Done. Saved: {self.stats['saved']}")
 
-            soup = BeautifulSoup(html, "html.parser")
-            full_text = soup.get_text(" ", strip=True)
+    def harvest_task(self, client, make, v_type, page, cutoff):
+        url = f"https://patpat.lk/search/{v_type}/{make}?page={page}"
+        html = client.fetch(url, method="flaresolverr") # Patpat needs strict FlareSolverr
+        if not html: return
 
-            final_date = item['date']
-            if final_date == "Check_Page":
-                dm = re.search(r'(\d{4}-\d{2}-\d{2})', full_text)
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if '/vehicle/' in href:
+                if not href.startswith("http"): href = "https://patpat.lk" + href
+                
+                with self.lock:
+                    if self.is_seen(href):
+                        self.stats['dupes'] += 1
+                        continue
+                    self.mark_seen(href)
+                
+                # Grab basic info from listing if available
+                title = link.get_text(" ", strip=True)
+                item = {'url': href, 'make': make, 'type': v_type, 'title': title, 'price': '0', 'date': 'Check_Page'}
+                
+                # Fetch Ad Page Content HERE (Original logic)
+                ad_html = client.fetch(href, method="flaresolverr")
+                if ad_html:
+                    self.queue.put({'item': item, 'html': ad_html})
+
+    def extractor_worker(self, cutoff):
+        re_date = re.compile(r'(\d{4}-\d{2}-\d{2})')
+        re_trans = re.compile(r'\b(Automatic|Manual|Tiptronic)\b', re.IGNORECASE)
+        re_phone = re.compile(r'(?:0\d{1,2}|07\d)[- ]?\d{3}[- ]?\d{4}')
+
+        while not self.stop_event.is_set() or not self.queue.empty():
+            try: record = self.queue.get(timeout=3)
+            except: continue
+            
+            try:
+                item = record['item']
+                soup = BeautifulSoup(record['html'], "html.parser")
+                full_text = soup.get_text(" ", strip=True)
+
+                # Date Extraction
+                dm = re_date.search(full_text)
                 if dm:
                     try:
-                        if datetime.strptime(dm.group(1), "%Y-%m-%d") < cutoff_date:
-                            with stats_lock: stats['skipped_date'] += 1
-                            continue
-                        final_date = dm.group(1)
+                        if datetime.strptime(dm.group(1), "%Y-%m-%d") < cutoff: continue
+                        item['date'] = dm.group(1)
                     except: pass
-                else:
-                    final_date = datetime.now().strftime("%Y-%m-%d")
+                else: item['date'] = datetime.now().strftime("%Y-%m-%d")
 
-            details = {
-                'YOM': '', 'Transmission': '', 'Fuel': '', 
-                'Engine': '', 'Mileage': '', 'Contact': 'Unknown', 
-                'Location': '', 'Description': ''
-            }
+                # Price Extraction
+                pm = re.search(r'Rs\.?\s*([\d,]+)', full_text)
+                if pm: item['price'] = pm.group(1).replace(',', '')
 
-            # 🔴 SMART AUTO-CORRECTION
-            final_make = item['make']
-            final_type = item['type']
-            title_lower = item['title'].lower()
-            
-            # 1. FIX MAKE (e.g. Tata -> Mitsubishi)
-            if final_make not in title_lower:
-                for m in MAKES:
-                    if m in title_lower:
-                        final_make = m
-                        break
-            
-            # 2. FIX TYPE (Generic Keywords only - Preserves 'Pickup' for Defenders)
-            if 'suv' in title_lower or 'jeep' in title_lower: final_type = 'suvs'
-            elif 'van' in title_lower: final_type = 'vans'
-            elif 'car' in title_lower or 'sedan' in title_lower or 'hatchback' in title_lower: final_type = 'cars'
-            elif 'pickup' in title_lower or 'cab' in title_lower: final_type = 'pickups'
+                details = {'YOM': '', 'Transmission': '', 'Fuel': '', 'Engine': '', 'Mileage': '', 'Contact': '', 'Location': '', 'Description': ''}
 
-            # 🟢 DOM FIX
-            labels = soup.find_all('p', class_='moreh')
-            for label in labels:
-                txt = label.get_text(strip=True).lower()
-                parent_td = label.find_parent('td')
-                if parent_td:
-                    value_td = parent_td.find_next_sibling('td')
-                    if value_td:
-                        val = value_td.get_text(strip=True)
-                        if 'mileage' in txt: details['Mileage'] = val + " km" if "km" not in val.lower() else val
-                        elif 'engine' in txt or 'capacity' in txt: details['Engine'] = val + " cc" if "cc" not in val.lower() else val
-                        elif 'transmission' in txt: details['Transmission'] = val
-                        elif 'fuel' in txt: details['Fuel'] = val
-                        elif 'yom' in txt or 'year' in txt: details['YOM'] = val
+                # DOM Parsing
+                for row in soup.find_all('tr'):
+                    cols = row.find_all('td')
+                    if len(cols) == 2:
+                        k = cols[0].get_text(strip=True).lower()
+                        v = cols[1].get_text(strip=True)
+                        if 'mileage' in k: details['Mileage'] = v
+                        elif 'engine' in k: details['Engine'] = v
+                        elif 'transmission' in k: details['Transmission'] = v
+                        elif 'fuel' in k: details['Fuel'] = v
+                        elif 'year' in k: details['YOM'] = v
+                
+                if not details['Transmission']:
+                    m = re_trans.search(full_text)
+                    if m: details['Transmission'] = m.group(1).capitalize()
+                
+                phones = re_phone.findall(full_text)
+                if phones: details['Contact'] = " / ".join(set([p.replace('-','').replace(' ','') for p in phones]))
 
-            if not details['YOM']:
-                m_yom = re_yom.search(item['title'])
-                if m_yom: details['YOM'] = m_yom.group(1)
+                # Unified Write
+                basic_row = {
+                    'Source': 'Patpat', 'Date': item['date'], 'Make': item['make'], 
+                    'Type': item['type'], 'YOM': details['YOM'], 'Model': item['title'], 
+                    'Price': item['price'], 'URL': item['url']
+                }
+                self.unified_writer.add_row(basic_row)
+                
+                # Detailed Write
+                detail_row = {**basic_row, **details}
+                del detail_row['Source']
+                self.detail_writer.add_row(detail_row)
+                
+                with self.lock: self.stats['saved'] += 1
 
-            phones = re_phone.findall(full_text)
-            if phones:
-                clean_phones = list(set([p.replace('-', '').replace(' ', '') for p in phones]))
-                details['Contact'] = " / ".join(clean_phones)
+            except: pass
+            finally: self.queue.task_done()
 
-            h1 = soup.find('h1')
-            if h1 and " in " in h1.get_text():
-                details['Location'] = h1.get_text().split(" in ")[-1].strip()
-            # 🟢 LOCATION FIX (ALLOWS HYPHENS LIKE JA-ELA)
-            elif (loc_m := re.search(r'-sale-([a-zA-Z-]+)-\d', item['url'])):
-                details['Location'] = loc_m.group(1).replace('-', ' ').title()
 
-            desc_h = soup.find(string=re.compile(r'Description', re.IGNORECASE))
-            if desc_h:
-                container = desc_h.find_parent().find_next('div') or desc_h.find_parent().find_next('p')
-                if container: details['Description'] = container.get_text(strip=True)[:500]
-
-            row_detailed = {'Date': final_date, 'Make': final_make, 'Type': final_type, 'YOM': details['YOM'], 'Model': item['title'], 'Price': item['price'], 'Transmission': details['Transmission'], 'Fuel': details['Fuel'], 'Engine': details['Engine'], 'Mileage': details['Mileage'], 'Location': details['Location'], 'Contact': details['Contact'], 'URL': item['url']}
-            row_basic = {k: v for k, v in row_detailed.items() if k in basic_writer.fieldnames}
-
-            basic_writer.add_row(row_basic)
-            detail_writer.add_row(row_detailed)
-            with stats_lock: stats['saved'] += 1
-
-        except: pass
-        finally: ad_queue.task_done()
-    
-    client.destroy_session()
-
-def main():
-    cutoff = datetime.now() - timedelta(days=DAYS_TO_KEEP)
-    folder = "riyasewana_dom_data"
-    if not os.path.exists(folder): os.makedirs(folder)
-    
-    ts = time.strftime('%Y-%m-%d_%H-%M')
-    basic_csv = f"{folder}/RIYA_BASIC_{ts}.csv"
-    detail_csv = f"{folder}/RIYA_DETAILED_{ts}.csv"
-    
-    basic_fields = ['Date', 'Make', 'Type', 'YOM', 'Model', 'Price']
-    detail_fields = ['Date', 'Make', 'Type', 'YOM', 'Model', 'Price', 'Transmission', 'Fuel', 'Engine', 'Mileage', 'Location', 'Contact', 'URL']
-
-    bw = BatchWriter(basic_csv, basic_fields)
-    dw = BatchWriter(detail_csv, detail_fields)
-    client_test = FlareSolverrClient()
-    
-    print("🚀 Starting Hybrid Extraction...")
-    
-    ex_pool = ThreadPoolExecutor(max_workers=DETAIL_WORKERS)
-    for _ in range(DETAIL_WORKERS):
-        ex_pool.submit(extractor_worker, bw, dw, cutoff)
-        time.sleep(0.1)
-
-    tasks = []
-    for make in MAKES:
-        for v_type in TYPES:
-            for page in range(1, MAX_PAGES_PER_COMBO + 1):
-                tasks.append((make, v_type, page))
-    random.shuffle(tasks)
-    
-    with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as s_pool:
-        futures = []
-        for (m, t, p) in tasks:
-            futures.append(s_pool.submit(harvest_task, client_test, m, t, p, cutoff))
+# ==========================================
+# 3️⃣ IKMAN SCRAPER CLASS
+# ==========================================
+class IkmanScraper:
+    def __init__(self, unified_writer):
+        self.unified_writer = unified_writer
+        self.detail_writer = None
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.stats = {'saved': 0}
+        self.lock = threading.Lock()
+        self.seen_urls = set()
         
-        with tqdm(total=len(futures), desc="Crawling", unit="pg") as pbar:
-            for _ in as_completed(futures):
-                pbar.update(1)
-                pbar.set_postfix({
-                    "Sv": stats['saved'], 
-                    "Dup": stats['dupes'], 
-                    "Fast": stats['fast_hits'],
-                    "Slow": stats['slow_hits']
-                })
+        self.makes = ['toyota', 'nissan', 'suzuki', 'honda', 'mitsubishi', 'mazda', 'kia', 'hyundai', 'bmw', 'mercedes-benz']
+        self.types = ['cars', 'vans', 'suvs', 'motorbikes']
+        self.max_pages = 10 # Ikman has strict pagination limits usually
+        self.workers = 4
 
-    ad_queue.join()
-    stop_event.set()
-    ex_pool.shutdown(wait=True)
-    bw.flush()
-    dw.flush()
-    print("\n✅ DONE")
+    def run(self):
+        print("\n" + "="*50)
+        print("🚀 STARTING: IKMAN.LK SCRAPER")
+        print("="*50)
+        
+        cutoff = datetime.now() - timedelta(days=DAYS_TO_KEEP)
+        det_csv = f"{DATA_FOLDER}/IKMAN_DETAILED_{TS}.csv"
+        det_fields = ['Date', 'Make', 'Type', 'YOM', 'Model', 'Price', 'Transmission', 'Fuel', 'Engine', 'Mileage', 'Location', 'Contact', 'URL']
+        self.detail_writer = UnifiedBatchWriter(det_csv, det_fields)
+        
+        client = FlareSolverrClient()
+        
+        # Start Extractors
+        ex_pool = ThreadPoolExecutor(max_workers=self.workers)
+        for _ in range(self.workers):
+            ex_pool.submit(self.extractor_worker, cutoff)
+
+        # Start Crawling
+        tasks = []
+        for m in self.makes:
+            for t in self.types:
+                for p in range(1, self.max_pages + 1):
+                    tasks.append((m, t, p))
+        random.shuffle(tasks)
+        
+        with ThreadPoolExecutor(max_workers=2) as s_pool:
+            futures = [s_pool.submit(self.harvest_task, client, m, t, p) for m, t, p in tasks]
+            with tqdm(total=len(futures), desc="Ikman Crawl") as pbar:
+                for _ in as_completed(futures):
+                    pbar.update(1)
+        
+        self.queue.join()
+        self.stop_event.set()
+        ex_pool.shutdown(wait=True)
+        self.detail_writer.flush()
+        print(f"✅ Ikman Done. Saved: {self.stats['saved']}")
+
+    def harvest_task(self, client, make, v_type, page):
+        url = f"https://ikman.lk/en/ads/sri-lanka/{v_type}/{make}"
+        if page > 1: url += f"?page={page}"
+        
+        html = client.fetch(url, method="flaresolverr")
+        if not html: return
+
+        soup = BeautifulSoup(html, 'html.parser')
+        items = soup.find_all('li', class_=re.compile(r'(normal|top-ad)--'))
+        
+        for item in items:
+            a_tag = item.find('a', href=True)
+            if not a_tag: continue
+            href = f"https://ikman.lk{a_tag['href']}"
+            
+            with self.lock:
+                if href in self.seen_urls: continue
+                self.seen_urls.add(href)
+            
+            title_tag = item.find('h2', class_=re.compile(r'heading--'))
+            title = title_tag.get_text(strip=True) if title_tag else "Unknown"
+            
+            price = "0"
+            price_tag = item.find('div', class_=re.compile(r'price--'))
+            if price_tag:
+                pm = re.search(r'Rs\s*([\d,]+)', price_tag.get_text(strip=True))
+                if pm: price = pm.group(1).replace(',', '')
+                
+            self.queue.put({'url': href, 'make': make, 'type': v_type, 'title': title, 'price': price, 'date': 'Check_Page'})
+
+    def extractor_worker(self, cutoff):
+        client = FlareSolverrClient()
+        re_fuel = re.compile(r'\b(Petrol|Diesel|Hybrid|Electric|CNG)\b', re.IGNORECASE)
+        re_trans = re.compile(r'\b(Automatic|Manual|Tiptronic)\b', re.IGNORECASE)
+        re_phone = re.compile(r'(?:07\d|0\d{2})[- ]?\d{3}[- ]?\d{4}')
+
+        while not self.stop_event.is_set() or not self.queue.empty():
+            try: item = self.queue.get(timeout=3)
+            except: continue
+            
+            try:
+                html = client.fetch(item['url'], method="flaresolverr")
+                if not html: continue
+                soup = BeautifulSoup(html, "html.parser")
+                full_text = soup.get_text(" ", strip=True)
+
+                # Date parsing (Complex Ikman logic)
+                if item['date'] == "Check_Page":
+                    # Simplified for master script (Current date default if parsing fails)
+                    item['date'] = datetime.now().strftime("%Y-%m-%d")
+
+                details = {'YOM': '', 'Transmission': '', 'Fuel': '', 'Engine': '', 'Mileage': '', 'Contact': '', 'Location': ''}
+                
+                # Regex Sweep
+                m_fuel = re_fuel.search(full_text)
+                if m_fuel: details['Fuel'] = m_fuel.group(1).title()
+                m_trans = re_trans.search(full_text)
+                if m_trans: details['Transmission'] = m_trans.group(1).title()
+                
+                # Text Stream for YOM/Engine
+                lines = [line.strip().lower() for line in soup.get_text("\n").split("\n") if line.strip()]
+                for i, line in enumerate(lines):
+                    if i + 1 < len(lines):
+                        next_line = lines[i+1]
+                        if 'model year' in line and not details['YOM']: details['YOM'] = next_line
+                        elif 'engine capacity' in line and not details['Engine']: details['Engine'] = next_line
+                        elif 'mileage' in line and not details['Mileage']: details['Mileage'] = next_line
+                
+                phones = re_phone.findall(full_text)
+                if phones: details['Contact'] = " / ".join(set([p.replace('-','').replace(' ','') for p in phones]))
+
+                # Unified Write
+                basic_row = {
+                    'Source': 'Ikman', 'Date': item['date'], 'Make': item['make'], 
+                    'Type': item['type'], 'YOM': details['YOM'], 'Model': item['title'], 
+                    'Price': item['price'], 'URL': item['url']
+                }
+                self.unified_writer.add_row(basic_row)
+                
+                # Detailed Write
+                detail_row = {**basic_row, **details}
+                del detail_row['Source']
+                self.detail_writer.add_row(detail_row)
+                
+                with self.lock: self.stats['saved'] += 1
+            except: pass
+            finally: self.queue.task_done()
+        client.destroy_session()
+
+# ==========================================
+# 🏁 MAIN EXECUTION
+# ==========================================
+def main():
+    print(f"🚀 VEHICLE MASTER SCRAPER STARTED")
+    print(f"📂 Saving to: {DATA_FOLDER}")
+    
+    # 1. Initialize Unified Basic Writer
+    unified_csv = f"{DATA_FOLDER}/ALL_SITES_BASIC_{TS}.csv"
+    unified_fields = ['Source', 'Date', 'Make', 'Type', 'YOM', 'Model', 'Price', 'URL']
+    unified_writer = UnifiedBatchWriter(unified_csv, unified_fields)
+    
+    # 2. Run Scrapers Sequentially
+    try:
+        # Step A: Riyasewana
+        riya = RiyasewanaScraper(unified_writer)
+        riya.run()
+        
+        time.sleep(5) # Cool down
+        
+        # Step B: Patpat
+        patpat = PatpatScraper(unified_writer)
+        patpat.run()
+        
+        time.sleep(5) # Cool down
+        
+        # Step C: Ikman
+        ikman = IkmanScraper(unified_writer)
+        ikman.run()
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by User")
+    
+    # 3. Finalize
+    unified_writer.flush()
+    print("\n✅ MASTER JOB COMPLETE")
+    print(f"📊 Check folder '{DATA_FOLDER}' for output.")
 
 if __name__ == "__main__":
     main()
