@@ -443,11 +443,6 @@ def main():
     unified_writer = UnifiedBatchWriter(unified_csv, unified_fields)
     
     try:
-        riya = RiyasewanaScraper(unified_writer)
-        riya.run()
-        
-        print("⏳ Cooling down 10s...")
-        time.sleep(10)
         
         patpat = PatpatScraper(unified_writer)
         patpat.run()
